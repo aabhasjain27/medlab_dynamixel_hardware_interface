@@ -4,7 +4,8 @@
     baudrate: 1000000
     feedback_rate: 50.0
 
-    motor_names: [motor_1, motor_2, motor_3, motor_4]
+    motor_names: [inner_motor, middle_motor, outer_motor,
+               global_rotation_motor, global_insertion_motor]
     motor_ids: [1, 2, 3, 4]
 
     operating_modes:
@@ -12,6 +13,8 @@
       - extended_position
       - extended_position
       - extended_position
+      - extended_position
+
 
     current_scales: [1.0, 1.0, 1.0, 1.0]
 

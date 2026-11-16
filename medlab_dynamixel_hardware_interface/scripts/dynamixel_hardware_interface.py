@@ -5,6 +5,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from dynamixel_sdk import PortHandler, PacketHandler, GroupBulkRead
 from rclpy.executors import ExternalShutdownException
+from serial.serialutil import SerialException
 
 from ament_index_python.packages import get_package_share_directory
 from pathlib import Path
@@ -14,8 +15,11 @@ from medlab_dynamixel_hardware_interface.utils.motor_models import (
     OPERATING_MODES,
 )
 from medlab_dynamixel_hardware_interface.srv import SetMotorTorqueEnable
-
+from medlab_dynamixel_hardware_interface.srv import SetMotorZero
 import math
+import os
+import yaml
+import tempfile
 
 from dynamixel_sdk import (
     PortHandler,
@@ -31,6 +35,7 @@ class DynamixelHardwareInterface(Node):
 
         self.loadParameters()
         self.setupHardware()
+        self.loadZeroOffsets()
         self.setupIO()
 
         self.get_logger().info("Dynamixel hardware interface started")
@@ -43,7 +48,8 @@ class DynamixelHardwareInterface(Node):
         self.declare_parameter("motor_ids", [1])
         self.declare_parameter("current_scales", [1.0])
         self.declare_parameter("operating_modes", ["position"])
-
+        self.declare_parameter("zero_offsets_path", "")
+        
         self.port_name = self.get_parameter("port").value
         self.baudrate = self.get_parameter("baudrate").value
         self.feedback_rate = float(self.get_parameter("feedback_rate").value)
@@ -51,7 +57,7 @@ class DynamixelHardwareInterface(Node):
         self.motor_ids = list(self.get_parameter("motor_ids").value)
         self.current_scales = list(self.get_parameter("current_scales").value)
         self.operating_modes = list(self.get_parameter("operating_modes").value)
-
+        
         if not self.motor_names or not (
             len(self.motor_names)
             == len(self.motor_ids)
@@ -75,7 +81,11 @@ class DynamixelHardwareInterface(Node):
         for mode in self.operating_modes:
             if mode not in OPERATING_MODES:
                 raise ValueError(f"Unsupported operating mode: {mode}")
-            
+        
+        self.zero_offsets_path = os.path.expanduser(
+            self.get_parameter("zero_offsets_path").value
+        )
+        
     def setupHardware(self):
         models_dir = Path(
             get_package_share_directory("medlab_dynamixel_hardware_interface")
@@ -163,6 +173,12 @@ class DynamixelHardwareInterface(Node):
             "~/set_motor_torque_enable",
             self.setMotorTorqueEnableCallback,
         )
+        
+        self.zero_service = self.create_service(
+            SetMotorZero,
+            "~/set_motor_zero",
+            self.setMotorZeroCallback
+        )
 
     
     def jointCommandCallback(self, msg):
@@ -201,8 +217,8 @@ class DynamixelHardwareInterface(Node):
             unit = model.get_unit("Goal Position")
 
             # Convert radians to raw Dynamixel position units.
-            raw = round((position - unit.offset) / unit.scale)
-
+            absolute_position = position + self.zero_offsets[name]
+            raw = round((absolute_position - unit.offset) / unit.scale)
             # Check that the value fits the register.
             bits = reg.size * 8
 
@@ -308,6 +324,53 @@ class DynamixelHardwareInterface(Node):
 
         return response
 
+    def setMotorZeroCallback(self, request, response):
+        motor = next(
+            (m for m in self.motors if m["name"] == request.name),
+            None
+        )
+
+        if motor is None:
+            response.success = False
+            response.message = f"Unknown motor: {request.name}"
+            return response
+
+        try:
+            # Read current motor position directly from Dynamixel
+            reg = motor["model"].get_register("Present Position")
+
+            raw, result, error = self.packet.read4ByteTxRx(
+                self.port, motor["id"], reg.address
+            )
+            self.check_result(result, error)
+
+            raw = self.signed(raw, reg.size * 8)
+            position = motor["model"].convert("Present Position", raw)
+
+            # Save current position as zero
+            old_offset = self.zero_offsets[request.name]
+            self.zero_offsets[request.name] = position
+
+            try:
+                self.saveZeroOffsets()
+            except Exception:
+                self.zero_offsets[request.name] = old_offset
+                raise
+
+            response.success = True
+            response.message = (
+                f"{request.name}: zero set at {position:.4f} rad"
+            )
+
+            self.get_logger().info(response.message)
+
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self.get_logger().error(response.message)
+
+        return response
+    
     def configure_operating_mode(self, dxl_id, model, mode_name):
         mode_reg = model.get_register("Operating Mode")
         torque_reg = model.get_register("Torque Enable")
@@ -371,7 +434,60 @@ class DynamixelHardwareInterface(Node):
             raise RuntimeError(f"{motor['name']}: {name} unavailable")
 
         return self.bulk_read.getData(dxl_id, reg.address, reg.size)
+    
+    def loadZeroOffsets(self):
+        self.zero_offsets = {name: 0.0 for name in self.motor_names}
 
+        if not self.zero_offsets_path:
+            return
+
+        if not os.path.isfile(self.zero_offsets_path):
+            self.get_logger().warn("Zero offsets file not found. Using zero offsets.")
+            return
+
+        with open(self.zero_offsets_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+
+        offsets = data.get("zero_offsets", {})
+
+        for name in self.motor_names:
+            if name in offsets:
+                value = float(offsets[name])
+
+                if not math.isfinite(value):
+                    raise ValueError(f"Invalid zero offset for {name}")
+
+                self.zero_offsets[name] = value
+
+        self.get_logger().info(f"Loaded motor zero offsets from {self.zero_offsets_path}")
+    
+    def saveZeroOffsets(self):
+        if not self.zero_offsets_path:
+            raise RuntimeError("zero_offsets_path is not configured")
+
+        directory = os.path.dirname(os.path.abspath(self.zero_offsets_path))
+        os.makedirs(directory, exist_ok=True)
+
+        temp_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=directory,
+                suffix=".yaml",
+                delete=False
+            ) as f:
+                temp_path = f.name
+                yaml.safe_dump({"zero_offsets": self.zero_offsets}, f)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temp_path, self.zero_offsets_path)
+
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+                
     @staticmethod
     def signed(raw, bits):
         mask = (1 << bits) - 1
@@ -394,7 +510,15 @@ class DynamixelHardwareInterface(Node):
                 raw_velocity = self.read_register(motor, "Present Velocity")
                 raw_current = self.read_register(motor, "Present Current")
 
-                position = model.convert("Present Position", raw_position)
+                raw_position = self.read_register(motor, "Present Position")
+                position_reg = model.get_register("Present Position")
+
+                raw_position = self.signed(
+                    raw_position, position_reg.size * 8
+                )
+
+                absolute_position = model.convert("Present Position", raw_position)
+                position = absolute_position - self.zero_offsets[motor["name"]]
                 velocity = model.convert("Present Velocity", raw_velocity)
 
                 current_reg = model.get_register("Present Current")
@@ -457,14 +581,22 @@ def main(args=None):
     try:
         node = DynamixelHardwareInterface()
         rclpy.spin(node)
+
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+
+    except SerialException as exc:
+        rclpy.logging.get_logger("dynamixel_hardware_interface").error(
+            f"Cannot open Dynamixel serial port '{exc}'"
+        )
+        raise SystemExit(1)
+
     finally:
         if node is not None:
             node.destroy_node()
+
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

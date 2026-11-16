@@ -14,14 +14,22 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetMotorTorqueEnable.srv"
+  "srv/SetMotorZero.srv"
 )
 
 # Install the ROS 2 Python executable
+# Hardware interface
 install(
-  PROGRAMS
-    medlab_dynamixel_hardware_interface/scripts/dynamixel_hardware_interface.py
+  PROGRAMS medlab_dynamixel_hardware_interface/scripts/dynamixel_hardware_interface.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME dynamixel_hardware_interface
+)
+
+# Dynamixel GUI
+install(
+  PROGRAMS medlab_dynamixel_hardware_interface/scripts/dynamixel_gui.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME dynamixel_gui
 )
 
 # Install our Python utility modules alongside generated ROS interfaces.
