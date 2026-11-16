@@ -1,0 +1,20 @@
+/**/dynamixels:
+  ros__parameters:
+    port: /dev/ttyUSB0
+    baudrate: 1000000
+    feedback_rate: 50.0
+
+    motor_names: [motor_1, motor_2, motor_3, motor_4]
+    motor_ids: [1, 2, 3, 4]
+
+    operating_modes:
+      - extended_position
+      - extended_position
+      - extended_position
+      - extended_position
+
+    current_scales: [1.0, 1.0, 1.0, 1.0]
+
+    # Software position limits (rad)
+    position_min: [-6.28, -6.28, -6.28, -6.28]
+    position_max: [6.28, 6.28, 6.28, 6.28]
