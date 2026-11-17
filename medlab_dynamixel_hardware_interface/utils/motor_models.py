@@ -34,6 +34,7 @@ class MotorModel:
         self._load()
 
     def _load(self):
+        print(f"Loading model definition: {self.model_file}", flush=True)
         section = None
 
         with self.model_file.open() as file:
@@ -48,6 +49,7 @@ class MotorModel:
                     continue
 
                 fields = line.split("\t")
+                # print(f"Parsing model row: {fields}", flush=True)
 
                 if section == "control table":
                     if fields[0] == "Address":
@@ -148,7 +150,7 @@ class MotorModelDatabase:
                 raise FileNotFoundError(
                     f"Missing model definition: {path}"
                 )
-
+            
             self.cache[model_number] = MotorModel(
                 model_number, path
             )

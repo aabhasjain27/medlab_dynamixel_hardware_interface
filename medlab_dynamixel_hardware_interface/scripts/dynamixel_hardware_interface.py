@@ -2,10 +2,13 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+
 from sensor_msgs.msg import JointState
 from dynamixel_sdk import PortHandler, PacketHandler, GroupBulkRead
 from rclpy.executors import ExternalShutdownException
 from serial.serialutil import SerialException
+from std_srvs.srv import SetBool
 
 from ament_index_python.packages import get_package_share_directory
 from pathlib import Path
@@ -32,7 +35,8 @@ class DynamixelHardwareInterface(Node):
 
     def __init__(self):
         super().__init__("dynamixels")
-
+        self.commanded_positions = {}
+        self.calibration_mode = False
         self.loadParameters()
         self.setupHardware()
         self.loadZeroOffsets()
@@ -122,9 +126,16 @@ class DynamixelHardwareInterface(Node):
 
                 self.configure_operating_mode(dxl_id, model, mode_name)
 
+                try:
+                    model.get_register("Present Current")
+                    effort_register = "Present Current"
+                except KeyError:
+                    model.get_register("Present Load")
+                    effort_register = "Present Load"
+
                 registers = [
                     model.get_register(key)
-                    for key in ("Present Position", "Present Velocity", "Present Current")
+                    for key in ("Present Position", "Present Velocity", effort_register)
                 ]
 
                 start = min(reg.address for reg in registers)
@@ -141,6 +152,7 @@ class DynamixelHardwareInterface(Node):
                     "model": model,
                     "mode": mode_name,
                     "current_scale": float(current_scale),
+                    "effort_register": effort_register,
                 })
 
                 self.get_logger().info(
@@ -157,6 +169,13 @@ class DynamixelHardwareInterface(Node):
             "~/joint_commands",
             self.jointCommandCallback,
             10,
+        )
+        
+        self.calib_sub = self.create_subscription(
+            JointState,
+            "~/joint_calib_commands",
+            self.jointCalibCallback,
+            10
         )
             
         self.joint_state_pub = self.create_publisher(
@@ -179,9 +198,15 @@ class DynamixelHardwareInterface(Node):
             "~/set_motor_zero",
             self.setMotorZeroCallback
         )
+        
+        self.calibration_service = self.create_service(
+            SetBool,
+            "~/set_calibration_mode",
+            self.setCalibrationModeCallback
+        )
 
     
-    def jointCommandCallback(self, msg):
+    def sendMotorPositions(self, msg):
         if not msg.name or len(msg.name) != len(msg.position):
             self.get_logger().error("Invalid JointState command dimensions")
             return
@@ -263,7 +288,20 @@ class DynamixelHardwareInterface(Node):
 
         finally:
             self.bulk_write.clearParam()
+            
+        # self.commanded_positions.update(zip(msg.name, msg.position))
 
+    def jointCommandCallback(self, msg):
+        # Always store the latest normal motor targets
+        self.commanded_positions.update(zip(msg.name, msg.position))
+
+        if not self.calibration_mode:
+            self.sendMotorPositions(msg)
+
+
+    def jointCalibCallback(self, msg):
+        if self.calibration_mode:
+            self.sendMotorPositions(msg)
     
     def setMotorTorqueEnableCallback(self, request, response):
         motor_map = {motor["name"]: motor for motor in self.motors}
@@ -335,8 +373,13 @@ class DynamixelHardwareInterface(Node):
             response.message = f"Unknown motor: {request.name}"
             return response
 
+        if request.name not in self.commanded_positions:
+            response.success = False
+            response.message = f"No commanded target for {request.name}"
+            return response
+
         try:
-            # Read current motor position directly from Dynamixel
+            # Read current absolute motor position
             reg = motor["model"].get_register("Present Position")
 
             raw, result, error = self.packet.read4ByteTxRx(
@@ -347,9 +390,12 @@ class DynamixelHardwareInterface(Node):
             raw = self.signed(raw, reg.size * 8)
             position = motor["model"].convert("Present Position", raw)
 
-            # Save current position as zero
+            # Align current position with latest commanded target
+            target = self.commanded_positions[request.name]
+            new_offset = position - target
+
             old_offset = self.zero_offsets[request.name]
-            self.zero_offsets[request.name] = position
+            self.zero_offsets[request.name] = new_offset
 
             try:
                 self.saveZeroOffsets()
@@ -359,7 +405,8 @@ class DynamixelHardwareInterface(Node):
 
             response.success = True
             response.message = (
-                f"{request.name}: zero set at {position:.4f} rad"
+                f"{request.name}: reference set to {target:.4f} rad "
+                f"(offset: {new_offset:.4f} rad)"
             )
 
             self.get_logger().info(response.message)
@@ -369,6 +416,19 @@ class DynamixelHardwareInterface(Node):
             response.message = str(exc)
             self.get_logger().error(response.message)
 
+        return response
+    
+    def setCalibrationModeCallback(self, request, response):
+        self.calibration_mode = request.data
+
+        response.success = True
+        response.message = (
+            "Calibration mode enabled"
+            if self.calibration_mode
+            else "Calibration mode disabled"
+        )
+
+        self.get_logger().info(response.message)
         return response
     
     def configure_operating_mode(self, dxl_id, model, mode_name):
@@ -508,7 +568,7 @@ class DynamixelHardwareInterface(Node):
 
                 raw_position = self.read_register(motor, "Present Position")
                 raw_velocity = self.read_register(motor, "Present Velocity")
-                raw_current = self.read_register(motor, "Present Current")
+                raw_effort = self.read_register(motor, motor["effort_register"])
 
                 raw_position = self.read_register(motor, "Present Position")
                 position_reg = model.get_register("Present Position")
@@ -521,15 +581,19 @@ class DynamixelHardwareInterface(Node):
                 position = absolute_position - self.zero_offsets[motor["name"]]
                 velocity = model.convert("Present Velocity", raw_velocity)
 
-                current_reg = model.get_register("Present Current")
-                current = self.signed(
-                    raw_current, current_reg.size * 8
-                ) * motor["current_scale"]
+                effort_reg = model.get_register(motor["effort_register"])
+
+                effort = self.signed(
+                    raw_effort, effort_reg.size * 8
+                )
+
+                if motor["effort_register"] == "Present Current":
+                    effort *= motor["current_scale"]
 
                 msg.name.append(motor["name"])
                 msg.position.append(position)
                 msg.velocity.append(velocity)
-                msg.effort.append(current)
+                msg.effort.append(effort)
 
             self.joint_state_pub.publish(msg)
 
@@ -577,26 +641,24 @@ class DynamixelHardwareInterface(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = None
+    executor = SingleThreadedExecutor()
 
     try:
         node = DynamixelHardwareInterface()
-        rclpy.spin(node)
+        executor.add_node(node)
+        executor.spin()
 
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
 
-    except SerialException as exc:
-        rclpy.logging.get_logger("dynamixel_hardware_interface").error(
-            f"Cannot open Dynamixel serial port '{exc}'"
-        )
-        raise SystemExit(1)
-
     finally:
+        executor.shutdown()
+
         if node is not None:
             node.destroy_node()
 
         if rclpy.ok():
-            rclpy.shutdown()
+            rclpy.try_shutdown()
 
 if __name__ == "__main__":
     main()
